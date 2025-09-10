@@ -1,5 +1,6 @@
-#실행문구
+### 실행 예시
 
+```python
 clusters_by_layer = cluster_all_layers_activated(
     expert_outputs, router_logits,
     n_experts=8,        # 각 레이어에서 활성 상위 8명만
