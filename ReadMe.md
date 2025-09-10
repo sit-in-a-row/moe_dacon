@@ -16,3 +16,12 @@ clusters_by_layer = cluster_all_layers_activated(
 # 예시 출력
 for layer_key, clusters in clusters_by_layer.items():
     print(f"[Layer {layer_key}] clusters: {clusters}")
+```
+```python
+### Output 형태
+{
+  "0": ((3, 27, 12), (5, 11), (7,)),
+  "1": ((2, 9), (0, 4, 6), (1, 3)),
+  ...
+}
+```
