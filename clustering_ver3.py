@@ -152,8 +152,8 @@ def cluster_one_layer_activated(
     expert_outputs_layer,   # (E, T, D)
     router_logits_layer,    # (T, E)
     *,
-    n_experts=8,            # ★ 활성 상위 n명만 사용 (기본 8)
-    n_clusters=3,           # 결과 클러스터 개수 컷
+    n_experts=8,            # 활성 상위 n명만 사용 (기본 8)
+    distance_threshold=0.5, # ★ 반드시 지정: 1-CKA 기준 거리 임계값
     topk_assign=8,
     prob_threshold=None,
     min_activations=1,
@@ -162,19 +162,22 @@ def cluster_one_layer_activated(
     weight_by_router=False,
     token_stride=1,
     plot=False,
-    layer_idx=None
+    layer_idx=None,
+    linkage_method='average'
 ):
     """
-    이 레이어에서 '활성된 expert' 중 상위 n_experts명만 뽑아
-    동시 활성 교집합에서 CKA로 거리 계산 → average linkage → n_clusters로 컷.
+    활성 상위 n_experts → 동시 활성 교집합에서 1-CKA 거리 계산 →
+    계층 군집(linkage_method) →
+    distance_threshold 기준으로 클러스터링.
     """
     expert_ids, counts = collect_activated_ids_in_layer(
         router_logits_layer, topk_assign, prob_threshold,
-        min_activations=min_activations, cap=n_experts  # ← 여기서 8명으로 제한
+        min_activations=min_activations, cap=n_experts
     )
     k = len(expert_ids)
     if k < 2:
-        return {"clusters": tuple(), "ids": tuple(), "counts": np.asarray(counts), "order": tuple(), "linkage": None}
+        return {"clusters": tuple(), "ids": tuple(), "counts": np.asarray(counts),
+                "order": tuple(), "linkage": None}
 
     condensed, pair_counts = pairwise_cka_condensed_layer_activated(
         expert_outputs_layer, router_logits_layer, expert_ids,
@@ -185,14 +188,16 @@ def cluster_one_layer_activated(
     if np.isnan(condensed).any():
         raise ValueError("NaN distance 발생: pair_policy='max' 사용 또는 활성 기준을 완화하세요.")
 
-    Z = linkage(condensed, method='average')
+    Z = linkage(condensed, method=linkage_method)
     order = leaves_list(Z)
 
-    n_use = min(n_clusters, k)
-    labels = fcluster(Z, t=n_use, criterion='maxclust')  # 1..n_use
+    # --- distance threshold 기반 컷 ---
+    labels = fcluster(Z, t=float(distance_threshold), criterion='distance')  # 1..C
 
+    # --- 라벨 → 멤버 튜플 목록 ---
+    unique_labels = sorted(set(labels.tolist()), key=int)
     clusters = []
-    for c in range(1, n_use + 1):
+    for c in unique_labels:
         members = [expert_ids[i] for i in range(k) if labels[i] == c]
         clusters.append(tuple(members))
     clusters.sort(key=len, reverse=True)
@@ -203,47 +208,37 @@ def cluster_one_layer_activated(
         plt.figure(figsize=(8, 4))
         leaf_labels = [f"exp{expert_ids[i]}" for i in range(k)]
         dendrogram(Z, labels=leaf_labels)
-        ttl = f"Layer {layer_idx} — activated-only CKA (avg-link), k={k}, C={n_use}"
+        ttl = f"Layer {layer_idx} — activated-only 1-CKA (linkage={linkage_method}), k={k}, thr={distance_threshold}"
         plt.title(ttl)
         plt.tight_layout()
         plt.show()
-        # expert_ids의 포지션(0..k-1)으로 바꾸기 위한 매핑
-    id_to_pos = {eid: i for i, eid in enumerate(expert_ids)}
-    # condensed/pair_counts는 위에서 만든 쌍별 1-CKA와 샘플 수
-    intra_avg_unweighted = []
-    #intra_avg_weighted   = []
 
+    id_to_pos = {eid: i for i, eid in enumerate(expert_ids)}
+    intra_avg_unweighted = []
     for cl in clusters:
-        # cl은 실제 expert id들의 튜플 → 0..k-1 인덱스로 변환
         memb_pos = [id_to_pos[eid] for eid in cl]
         d_unw = cluster_intra_average_distance_from_condensed(
             condensed, memb_pos, use_weights=False
         )
-        #d_w = cluster_intra_average_distance_from_condensed(
-        #    condensed, memb_pos,
-        #    weights_condensed=pair_counts, use_weights=True
-        #)
         intra_avg_unweighted.append(d_unw)
-        #intra_avg_weighted.append(d_w)
 
     return {
-        "clusters": clusters,                # 예: ((0,27,12), (5,11), ...)
+        "clusters": clusters,
         "ids": tuple(expert_ids),
         "counts": counts,
-        "pair_counts": pair_counts,          # 쌍별 동시활성 샘플 수
-        "condensed": condensed,              # 쌍별 1-CKA
-        "intra_avg_unweighted": tuple(intra_avg_unweighted),  # 각 클러스터의 내부 평균거리
-        #"intra_avg_weighted":   tuple(intra_avg_weighted),    # (교집합 샘플 수 가중)
+        "pair_counts": pair_counts,
+        "condensed": condensed,
+        "intra_avg_unweighted": tuple(intra_avg_unweighted),
         "order": tuple(order.tolist()),
         "linkage": Z
     }
 
-# ============ 전체 레이어 실행: {"0": ((...), ...), ...} ============
+
 def cluster_all_layers_activated(
     expert_outputs, router_logits,
     *,
-    n_experts=8,            # ★ 레이어마다 활성 상위 8명만
-    n_clusters=3,
+    n_experts=8,
+    distance_threshold=0.5,   # ★ 반드시 지정
     topk_assign=8,
     prob_threshold=None,
     min_activations=1,
@@ -251,23 +246,38 @@ def cluster_all_layers_activated(
     pair_policy='max',
     weight_by_router=False,
     token_stride=1,
-    plot=False
+    plot=False,
+    linkage_method='average'
 ):
     """
-    모든 레이어에 대해 활성 상위 n_experts명만 사용하여 군집.
-    최종 반환: {"0": ((...), ...), "1": ((...), ...), ...}
+    모든 레이어에 대해 활성 상위 n_experts명만 사용하여,
+    distance_threshold 기준으로 클러스터링.
     """
     L, E, T, D = expert_outputs.shape
     out = {}
     for l in range(L):
         res = cluster_one_layer_activated(
             expert_outputs[l], router_logits[l],
-            n_experts=n_experts, n_clusters=n_clusters,
-            topk_assign=topk_assign, prob_threshold=prob_threshold,
-            min_activations=min_activations, min_samples=min_samples,
-            pair_policy=pair_policy, weight_by_router=weight_by_router,
-            token_stride=token_stride, plot=plot, layer_idx=l
+            n_experts=n_experts,
+            distance_threshold=distance_threshold,
+            topk_assign=topk_assign,
+            prob_threshold=prob_threshold,
+            min_activations=min_activations,
+            min_samples=min_samples,
+            pair_policy=pair_policy,
+            weight_by_router=weight_by_router,
+            token_stride=token_stride,
+            plot=plot,
+            layer_idx=l,
+            linkage_method=linkage_method
         )
         out[str(l)] = res["clusters"]
         pairs = list(zip(res["clusters"], res["intra_avg_unweighted"]))
+        print(f"\n[Layer {l}]")
+        print(f"  (distance_threshold = {distance_threshold}, metric = 1-CKA)")
+        for cl, d in pairs:
+            if np.isnan(d):
+                print(f"  {cl} -> avg_intra_dist = NaN")
+            else:
+                print(f"  {cl} -> avg_intra_dist = {d:.2f}")
     return out
