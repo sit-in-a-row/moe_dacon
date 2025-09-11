@@ -43,7 +43,7 @@ def collect_activated_ids_in_layer(router_logits_layer, topk_assign=8, prob_thre
     return ids, counts
 
 # ======================================================
-# 레이어별 활성 rep 수집 (초기 클러스터 = 각 expert의 활성 rep 집합)
+# 레이어별 rep 수집 (+ 필요시 router 확률도 함께)
 # ======================================================
 def _collect_rep_sets_for_layer(
     expert_outputs_layer,   # (E, T, D)
@@ -53,14 +53,9 @@ def _collect_rep_sets_for_layer(
     topk_assign=8,
     prob_threshold=None,
     min_activations=1,
-    token_stride=1
+    token_stride=1,
+    pooling_weight="none"   # "none" | "router"
 ):
-    """
-    활성 상위 n_experts 선정 후, 각 expert의 '활성 토큰에서의 rep'만 모아 초기 집합을 만든다.
-    반환:
-      rep_sets: list[np.ndarray] 각 (m_e, D)
-      expert_ids_used: list[int] rep_sets와 1:1 대응하는 expert id
-    """
     stride = max(1, int(token_stride))
     T = expert_outputs_layer.shape[1]
     tok_idx = np.arange(T)[::stride]  # (Ts,)
@@ -71,84 +66,105 @@ def _collect_rep_sets_for_layer(
     )
     ids = list(ids)
     if len(ids) == 0:
-        return [], []
+        return [], [], None
 
     act_full = get_active_token_mask_layer(router_logits_layer, topk_assign, prob_threshold)  # (E,T)
     act = act_full[:, tok_idx]  # (E, Ts)
 
+    use_router_w = (pooling_weight == "router")
+    probs = softmax(router_logits_layer, axis=-1) if use_router_w else None
+
     rep_sets, expert_ids_used = [], []
+    w_sets = [] if use_router_w else None
+
     for e in ids:
         m = act[e]
         idx = np.where(m)[0]
         X = expert_outputs_layer[e, tok_idx, :]
         X = X[idx, :]  # (m_e, D)
-        if X.shape[0] >= 1:
-            rep_sets.append(X)
-            expert_ids_used.append(e)
+        if X.shape[0] < 1:
+            continue
 
-    return rep_sets, expert_ids_used
+        rep_sets.append(X)
+        expert_ids_used.append(e)
+
+        if use_router_w:
+            w = probs[tok_idx, e][idx].astype(np.float64)  # (m_e,)
+            w_sets.append(w)
+
+    return rep_sets, expert_ids_used, w_sets
 
 # ======================================================
-# 거리 정의: (1) 모든 pair 평균 L2  (2) 중심(평균벡터) L2
+# 거리 유틸 (pairwise는 비가중, centroid는 가중 가능)
 # ======================================================
 def _avg_cross_l2(A, B):
-    """
-    A:(m,D), B:(n,D) → 모든 쌍 L2 평균 (스칼라)
-    """
-    a2 = np.sum(A*A, axis=1, keepdims=True)      # (m,1)
-    b2 = np.sum(B*B, axis=1, keepdims=True).T    # (1,n)
-    ab = A @ B.T                                  # (m,n)
+    a2 = np.sum(A*A, axis=1, keepdims=True)
+    b2 = np.sum(B*B, axis=1, keepdims=True).T
+    ab = A @ B.T
     d2 = np.maximum(a2 + b2 - 2.0*ab, 0.0)
     d = np.sqrt(d2)
     return float(d.mean())
 
-def _centroid_and_count(X):
+def _centroid_and_count(X, w=None, eps=1e-12):
     """
-    X:(m,D) → (mu:(D,), n:int)
+    X:(m,D) -> (mu:(D,), n_eff: float)
+    - w=None  : 산술평균, n_eff = m
+    - w!=None : 가중평균, n_eff = sum(w)
     """
-    return X.mean(axis=0), X.shape[0]
+    if (w is None) or (np.sum(w) <= eps):
+        return X.mean(axis=0), float(X.shape[0])
+    s = np.sum(w)
+    mu = (w[:, None] * X).sum(axis=0) / s
+    return mu, float(s)
 
 def _l2_between_centroids(mu_i, mu_j):
     diff = mu_i - mu_j
     return float(np.sqrt(np.dot(diff, diff)))
 
 # ======================================================
-# pooling-linkage agglomerative threshold 병합
-#   distance_mode:
-#     - "pairwise": 모든 pair 평균 L2 (정확 / 느림)
-#     - "centroid": 중심(평균벡터) L2 (가중합/빠름)
+# Agglomerative (threshold) — pooling_weight은 centroid에서만 사용
 # ======================================================
 def agglomerative_pooling_threshold(
     rep_sets,                 # list[np.ndarray]
     *,
-    threshold=0.5,            # 거리 임계값 (L2)
+    threshold=0.5,
     distance_mode="pairwise", # "pairwise" | "centroid"
+    pooling_weight="none",    # "none" | "router"   <-- NEW
+    w_sets=None,              # list[np.ndarray] | None (내부용)
     max_merges=None,
-    verbose=False
+    verbose=False,
+    eps=1e-12
 ):
     if distance_mode not in ("pairwise", "centroid"):
         raise ValueError("distance_mode은 'pairwise' 또는 'centroid'만 지원합니다.")
+    if pooling_weight not in ("none", "router"):
+        raise ValueError("pooling_weight는 'none' 또는 'router'만 지원합니다.")
 
-    # 초기 클러스터 표현
     clusters = [(i,) for i in range(len(rep_sets))]
 
     if distance_mode == "pairwise":
-        # 실제 rep를 쌓아 가며, 모든 pair L2 평균으로 거리 계산
+        # 비가중 모든 쌍 L2 평균
         rep_pooled = [rep_sets[i] for i in range(len(rep_sets))]
         def dist(i, j):
             return _avg_cross_l2(rep_pooled[i], rep_pooled[j])
         def merge_payload(i, j):
             return np.vstack([rep_pooled[i], rep_pooled[j]])
+
     else:
-        # centroid 모드: 각 클러스터를 (mu, n)로만 유지 → 빠르고 샘플 수로 자연스런 가중
-        centroids = []
-        counts = []
-        for X in rep_sets:
-            mu, n = _centroid_and_count(X)
-            centroids.append(mu)
-            counts.append(n)
-        centroids = list(centroids)
-        counts = list(counts)
+        # centroid 모드: pooling_weight에 따라 (가중)중심과 유효표본수 계산
+        use_router_w = (pooling_weight == "router")
+        if use_router_w:
+            if w_sets is None:
+                raise ValueError("pooling_weight='router'면 w_sets가 필요합니다.")
+            centroids, counts = [], []
+            for X, w in zip(rep_sets, w_sets):
+                mu, n = _centroid_and_count(X, w)
+                centroids.append(mu); counts.append(n)
+        else:
+            centroids, counts = [], []
+            for X in rep_sets:
+                mu, n = _centroid_and_count(X, None)
+                centroids.append(mu); counts.append(n)
 
         def dist(i, j):
             return _l2_between_centroids(centroids[i], centroids[j])
@@ -157,7 +173,11 @@ def agglomerative_pooling_threshold(
             n_i, n_j = counts[i], counts[j]
             mu_i, mu_j = centroids[i], centroids[j]
             n_new = n_i + n_j
-            mu_new = (n_i * mu_i + n_j * mu_j) / n_new
+            if n_new <= eps:
+                mu_new = 0.5 * (mu_i + mu_j)
+                n_new = eps
+            else:
+                mu_new = (n_i * mu_i + n_j * mu_j) / n_new
             return mu_new, n_new
 
     history = []
@@ -165,13 +185,12 @@ def agglomerative_pooling_threshold(
         if distance_mode == "pairwise":
             return clusters, rep_pooled, history
         else:
-            # centroid 모드는 rep가 아닌 (mu,n)만 들고 있으므로, 표시용으로 count만 반환
-            rep_sizes = counts[:]  # 크기 정보
+            rep_sizes = [int(n) for n in counts]
             return clusters, rep_sizes, history
 
     merges_done = 0
     while True:
-        # 1) 가장 가까운 쌍 찾기
+        # 가장 가까운 쌍
         best_d, best_pair = None, None
         K = len(clusters)
         for i in range(K-1):
@@ -180,39 +199,33 @@ def agglomerative_pooling_threshold(
                 if (best_d is None) or (d < best_d):
                     best_d, best_pair = d, (i, j)
 
-        # 2) 멈춤 조건
+        # 멈춤 조건
         if best_d is None or best_d > threshold:
             if verbose:
                 print(f"[stop] best_d={best_d} > thr={threshold} (or None)")
             break
 
-        # 3) 병합 실행
+        # 병합
         i, j = best_pair
         if verbose:
-            print(f"[merge] pair={clusters[i]} + {clusters[j]} @ d={best_d:.4f}")
+            print(f"[merge] {clusters[i]} + {clusters[j]} @ d={best_d:.4f}")
         new_members = tuple(sorted(clusters[i] + clusters[j]))
 
         if distance_mode == "pairwise":
-            new_rep = merge_payload(i, j)  # vstack
+            X_new = merge_payload(i, j)
         else:
             mu_new, n_new = merge_payload(i, j)
 
-        history.append({
-            "pair": (clusters[i], clusters[j]),
-            "distance": float(best_d),
-            "new_cluster": new_members
-        })
+        history.append({"pair": (clusters[i], clusters[j]),
+                        "distance": float(best_d),
+                        "new_cluster": new_members})
 
-        # 4) 상태 갱신 (큰 인덱스 먼저 pop)
+        # 상태 갱신
         ii, jj = max(i, j), min(i, j)
-        clusters.pop(ii)
-        clusters.pop(jj)
-        clusters.append(new_members)
+        clusters.pop(ii); clusters.pop(jj); clusters.append(new_members)
 
         if distance_mode == "pairwise":
-            rep_pooled.pop(ii)
-            rep_pooled.pop(jj)
-            rep_pooled.append(new_rep)
+            rep_pooled.pop(ii); rep_pooled.pop(jj); rep_pooled.append(X_new)
         else:
             centroids.pop(ii); counts.pop(ii)
             centroids.pop(jj); counts.pop(jj)
@@ -224,21 +237,16 @@ def agglomerative_pooling_threshold(
                 print(f"[stop] reached max_merges={max_merges}")
             break
 
-    # 5) 반환 포맷 통일
     if distance_mode == "pairwise":
-        # 각 클러스터의 rep 개수만 요약
         rep_sizes = [X.shape[0] for X in rep_pooled]
         return clusters, rep_pooled, history
     else:
-        # centroid 모드에선 실제 rep는 안 들고 있으니, 사이즈 리스트만 반환
-        rep_sizes = counts[:]
+        rep_sizes = [int(n) for n in counts]
         return clusters, rep_sizes, history
 
-# --- (A) 클러스터 정렬 유틸: 내부 오름차순, 바깥은 크기 내림차순/사전식 ---
+# --- 정렬 유틸 그대로 ---
 def _sort_clusters_stably(cluster_id_tuples):
-    # 내부 정렬
     clusters = [tuple(sorted(cl)) for cl in cluster_id_tuples]
-    # 바깥 정렬: 길이 내림차순, 동일 길이는 사전식
     clusters.sort(key=lambda c: (-len(c), c))
     return tuple(clusters)
 
@@ -255,13 +263,15 @@ def cluster_layer_by_pooling_threshold(
     min_activations=1,
     token_stride=1,
     threshold=0.5,
-    distance_mode="pairwise",  # "pairwise" | "centroid"
+    distance_mode="pairwise",   # "pairwise" | "centroid"
+    pooling_weight="none",      # "none" | "router"   <-- NEW
     verbose=False
 ):
-    rep_sets, ids_used = _collect_rep_sets_for_layer(
+    rep_sets, ids_used, w_sets = _collect_rep_sets_for_layer(
         expert_outputs_layer, router_logits_layer,
         n_experts=n_experts, topk_assign=topk_assign, prob_threshold=prob_threshold,
-        min_activations=min_activations, token_stride=token_stride
+        min_activations=min_activations, token_stride=token_stride,
+        pooling_weight=pooling_weight
     )
     if len(rep_sets) == 0:
         return {"clusters": [], "rep_sizes": [], "history": [], "ids_used": [], "distance_mode": distance_mode}
@@ -275,19 +285,21 @@ def cluster_layer_by_pooling_threshold(
         }
 
     clusters_idx, payload, history = agglomerative_pooling_threshold(
-        rep_sets, threshold=threshold, distance_mode=distance_mode, verbose=verbose
+        rep_sets,
+        threshold=threshold,
+        distance_mode=distance_mode,
+        pooling_weight=pooling_weight,
+        w_sets=w_sets,
+        verbose=verbose
     )
 
-    # 출력 정리
     clusters_ids = [tuple(ids_used[i] for i in cl) for cl in clusters_idx]
-
-    # ✅ 최종 정렬 적용
     clusters_ids = list(_sort_clusters_stably(clusters_ids))
-    
+
     if distance_mode == "pairwise":
-        rep_sizes = [rp.shape[0] for rp in payload]   # payload = rep_pooled
+        rep_sizes = [rp.shape[0] for rp in payload]
     else:
-        rep_sizes = payload                            # payload = sizes
+        rep_sizes = payload  # sizes
 
     return {
         "clusters": tuple(clusters_ids),
@@ -309,13 +321,10 @@ def cluster_all_layers_by_pooling_threshold(
     min_activations=1,
     token_stride=1,
     threshold=0.5,
-    distance_mode="pairwise",  # "pairwise" | "centroid"
+    distance_mode="pairwise",    # "pairwise" | "centroid"
+    pooling_weight="none",       # "none" | "router"
     verbose=False
 ):
-    """
-    모든 레이어에 대해 pooling-linkage agglomerative threshold clustering 수행
-    반환: dict[layer_str] = result(dict)
-    """
     L, E, T, D = expert_outputs.shape
     results = {}
     for l in range(L):
@@ -323,16 +332,17 @@ def cluster_all_layers_by_pooling_threshold(
             expert_outputs[l], router_logits[l],
             n_experts=n_experts, topk_assign=topk_assign, prob_threshold=prob_threshold,
             min_activations=min_activations, token_stride=token_stride,
-            threshold=threshold, distance_mode=distance_mode, verbose=verbose
+            threshold=threshold, distance_mode=distance_mode,
+            pooling_weight=pooling_weight, verbose=verbose
         )
         results[str(l)] = res
         if verbose:
-            print(f"\n[Layer {l}] thr={threshold}, mode={distance_mode}")
+            print(f"\n[Layer {l}] thr={threshold}, mode={distance_mode}, pool_w={pooling_weight}")
             for cl, sz in zip(res["clusters"], res["rep_sizes"]):
                 print(f"  cluster {cl} -> reps={sz}")
     return results
 
-# --- (C) 최종 간단 출력 래퍼: 원하는 형식으로 dict[str] -> tuple[tuple[int]] ---
+# --- 간단 출력 ---
 def cluster_all_layers_simple_output(
     expert_outputs, router_logits,
     *,
@@ -342,7 +352,8 @@ def cluster_all_layers_simple_output(
     min_activations=1,
     token_stride=1,
     threshold=0.5,
-    distance_mode="pairwise",  # "pairwise" | "centroid"
+    distance_mode="pairwise",
+    pooling_weight="none",
     verbose=False
 ):
     detailed = cluster_all_layers_by_pooling_threshold(
@@ -354,10 +365,7 @@ def cluster_all_layers_simple_output(
         token_stride=token_stride,
         threshold=threshold,
         distance_mode=distance_mode,
+        pooling_weight=pooling_weight,
         verbose=verbose
     )
-    simple = {}
-    for l_str, res in detailed.items():
-        # res["clusters"]는 이미 정렬된 tuple(tuple(...)) 형태
-        simple[l_str] = res["clusters"]
-    return simple
+    return {l_str: res["clusters"] for l_str, res in detailed.items()}
